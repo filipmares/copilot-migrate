@@ -9,6 +9,8 @@ match the new machine's home directory and path style.
     python3 copilot_migrate.py inspect BUNDLE
     python3 copilot_migrate.py import  BUNDLE [--map OLD=NEW] [--dry-run]
 
+On Windows the interpreter is `python`, not `python3`.
+
 Run `import` with the Copilot app fully quit.
 """
 
@@ -421,8 +423,9 @@ def cmd_export(args: argparse.Namespace) -> int:
 
         log("")
         log(f"Done: {tarball}  ({human(tarball.stat().st_size)})")
-        log(f"Next: copy it over, then run")
-        log(f"  python3 copilot_migrate.py import {tarball.name}")
+        log("Next: copy it over, then run (from inside the extracted bundle)")
+        log(f"  python3 copilot_migrate.py import {tarball.name}    # macOS, Linux")
+        log(f"  python  copilot_migrate.py import {tarball.name}    # Windows")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

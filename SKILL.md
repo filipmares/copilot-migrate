@@ -26,7 +26,10 @@ python3 copilot_migrate.py inspect BUNDLE
 python3 copilot_migrate.py import  BUNDLE [--map OLD=NEW] [--no-rewrite] [--dry-run]
 ```
 
-On Windows use `python` instead of `python3`.
+On Windows the interpreter is `python`, not `python3`. Windows ships a `python3`
+stub that opens the Microsoft Store instead of running anything, so using the
+wrong one fails quietly rather than loudly — tell the user to check
+`python --version` first.
 
 ## Workflow
 

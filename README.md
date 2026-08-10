@@ -34,23 +34,28 @@ git clone https://github.com/filipmares/copilot-migrate ~/.copilot/skills/copilo
 
 ```sh
 # On the old machine
-python3 copilot_migrate.py export --out ~/Desktop          # everything
-python3 copilot_migrate.py export --out ~/Desktop --no-history   # skip chat history
+python3 copilot_migrate.py export --out ~/Desktop                 # everything
+python3 copilot_migrate.py export --out ~/Desktop --no-history    # skip chat history
 
 # Look before you leap (read-only)
 python3 copilot_migrate.py inspect copilot-migration-*.tar.gz
 
 # On the new machine, with the Copilot app quit
-python  copilot_migrate.py import copilot-migration-*.tar.gz --dry-run
-python  copilot_migrate.py import copilot-migration-*.tar.gz
+python3 copilot_migrate.py import copilot-migration-*.tar.gz --dry-run
+python3 copilot_migrate.py import copilot-migration-*.tar.gz
 ```
+
+> **Windows:** the interpreter is `python`, not `python3` — substitute it in
+> every command above. Windows ships a `python3` stub that opens the Microsoft
+> Store rather than running anything, so the mistake is quiet rather than
+> obvious. Verify with `python --version` before starting.
 
 Import auto-detects the source home directory and maps it onto the new machine's
 home. Override when the layout differs:
 
 ```sh
-python copilot_migrate.py import bundle.tar.gz --map '/Users/alice=D:\dev\home'
-python copilot_migrate.py import bundle.tar.gz --no-rewrite
+python3 copilot_migrate.py import bundle.tar.gz --map '/Users/alice=D:\dev\home'
+python3 copilot_migrate.py import bundle.tar.gz --no-rewrite
 ```
 
 Every bundle ships a copy of the script, so the destination machine needs only
