@@ -16,9 +16,10 @@ paths on import.
 
 ## The script
 
-`scripts/copilot_migrate.py` — Python 3.9+, standard library only, no
-dependencies. Runs on macOS, Windows and Linux. Each bundle contains a copy of
-the script, so the destination machine needs nothing but Python.
+`scripts/copilot_migrate.py`, alongside this file — Python 3.9+, standard
+library only, no dependencies. Runs on macOS, Windows and Linux. Each bundle
+contains a copy of the script, so the destination machine needs nothing but
+Python.
 
 ```sh
 python3 copilot_migrate.py export  [--out DIR] [--no-history]

@@ -1,5 +1,7 @@
 # copilot-migrate
 
+[![skills.sh](https://skills.sh/b/filipmares/copilot-migrate)](https://skills.sh/filipmares/copilot-migrate)
+
 Move a [GitHub Copilot](https://github.com/features/copilot) app installation
 between machines — including across operating systems — without losing your
 projects, workflows, skills or tool permissions.
@@ -18,16 +20,25 @@ This tool rewrites them.
 
 ## Install
 
-Standalone — the script has no dependencies beyond Python 3.9+:
+Via [skills.sh](https://skills.sh) — works with Claude Code, Codex, Cursor,
+Copilot and [many other agents](https://github.com/vercel-labs/skills#supported-agents):
 
 ```sh
-curl -O https://raw.githubusercontent.com/filipmares/copilot-migrate/main/scripts/copilot_migrate.py
+npx skills add filipmares/copilot-migrate
 ```
 
-As a Copilot skill:
+As a GitHub Copilot skill, without the CLI:
 
 ```sh
-git clone https://github.com/filipmares/copilot-migrate ~/.copilot/skills/copilot-migrate
+git clone https://github.com/filipmares/copilot-migrate /tmp/cm \
+  && cp -r /tmp/cm/skills/copilot-migrate ~/.copilot/skills/
+```
+
+Standalone — the script has no dependencies beyond Python 3.9+, so you can skip
+the skill entirely:
+
+```sh
+curl -O https://raw.githubusercontent.com/filipmares/copilot-migrate/main/skills/copilot-migrate/scripts/copilot_migrate.py
 ```
 
 ## Use
