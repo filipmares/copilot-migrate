@@ -11,6 +11,8 @@ before copying. Export checks for the desktop process before starting, before
 database snapshots, and before packing, and aborts if it detects the app. This
 is a process check, not a lock; it cannot prevent the app being launched between
 checks or make databases and changing session files a coordinated snapshot.
+On Windows, export uses extended-length paths for session-tree copying and
+packing to support deeply nested journals.
 
 ```sh
 python3 copilot_migrate.py export --out DIR [--no-history]

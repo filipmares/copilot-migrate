@@ -13,6 +13,8 @@ Export checks for the desktop process before starting, before database snapshots
 and before packing, and aborts if it detects the app. This is a process check,
 not a lock: it cannot prevent the app from being launched between checks or
 guarantee one coordinated snapshot of the databases and session files.
+On Windows, export uses extended-length paths while copying and packing session
+trees so deeply nested journals are not skipped due to legacy path limits.
 
 ```sh
 # Source: use `python` instead of `python3` on Windows

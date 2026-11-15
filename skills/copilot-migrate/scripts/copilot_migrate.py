@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -97,6 +98,18 @@ def log(msg: str = "") -> None:
 
 def copilot_home() -> Path:
     return Path(os.environ.get("COPILOT_HOME") or Path.home() / ".copilot")
+
+
+def windows_long_path(path, enabled=None) -> str:
+    if enabled is None:
+        enabled = os.name == "nt"
+    value = os.fspath(path)
+    if not enabled or value.startswith("\\\\?\\"):
+        return value
+    value = ntpath.abspath(value)
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
 
 
 def running_copilot_desktop_processes() -> list[str]:
@@ -178,6 +191,8 @@ def should_prune(path: Path, durable: bool = False) -> bool:
 
 def copy_tree(src: Path, dst: Path, durable: bool = False) -> int:
     """Copy src into dst, following symlinks and pruning runtime junk."""
+    src = Path(windows_long_path(src))
+    dst = Path(windows_long_path(dst))
     count = 0
     if not src.exists():
         return 0
@@ -502,7 +517,7 @@ def session_warnings(root: Path, history: bool) -> list[str]:
 
 
 def report_session_warnings(root: Path, history: bool) -> list[str]:
-    warnings = session_warnings(root, history)
+    warnings = session_warnings(Path(windows_long_path(root)), history)
     for warning in warnings:
         log(f"  ! {warning}")
     return warnings
@@ -614,7 +629,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         tarball = out_dir / f"copilot-migration-{stamp}.tar.gz"
         with tarball.open("xb") as out:
             with tarfile.open(fileobj=out, mode="w:gz") as tf:
-                tf.add(stage, arcname=stage.name)
+                tf.add(windows_long_path(stage), arcname=stage.name)
 
         log("")
         log(f"Done: {tarball}  ({human(tarball.stat().st_size)})")
@@ -627,6 +642,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def write_manifest(stage: Path, src: Path, stamp: str) -> None:
+    stage = Path(windows_long_path(stage))
     lines = [
         f"# Copilot migration manifest - {stamp}",
         f"# Source home: {src}",

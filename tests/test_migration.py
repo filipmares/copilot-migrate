@@ -81,6 +81,22 @@ class MigrationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "quit it fully before exporting"):
                 MIGRATE.cmd_export(SimpleNamespace())
 
+    def test_windows_long_path_handles_drive_and_unc_paths(self):
+        self.assertEqual(
+            r"\\?\C:\Users\Alex Example\.copilot\session-state",
+            MIGRATE.windows_long_path(
+                r"C:\Users\Alex Example\.copilot\session-state", enabled=True
+            ),
+        )
+        self.assertEqual(
+            r"\\?\UNC\server\share\Copilot Backup",
+            MIGRATE.windows_long_path(r"\\server\share\Copilot Backup", enabled=True),
+        )
+        self.assertEqual(
+            r"\\?\C:\already-prefixed",
+            MIGRATE.windows_long_path(r"\\?\C:\already-prefixed", enabled=True),
+        )
+
     @patch.object(MIGRATE.sys, "platform", "win32")
     @patch.object(MIGRATE.subprocess, "run")
     def test_windows_process_check_matches_github_desktop(self, run):
