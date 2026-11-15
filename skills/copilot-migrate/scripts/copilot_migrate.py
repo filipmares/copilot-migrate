@@ -17,11 +17,13 @@ Run `import` with the Copilot app fully quit.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -95,6 +97,58 @@ def log(msg: str = "") -> None:
 
 def copilot_home() -> Path:
     return Path(os.environ.get("COPILOT_HOME") or Path.home() / ".copilot")
+
+
+def running_copilot_desktop_processes() -> list[str]:
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return [
+            f"{row[0]} (PID {row[1]})"
+            for row in csv.reader(result.stdout.splitlines())
+            if len(row) >= 2 and row[0].lower() == "github.exe"
+        ]
+
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,command="],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    processes = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, command = parts
+        lowered = command.lower()
+        if sys.platform == "darwin":
+            is_copilot = (
+                "/github copilot.app/contents/macos/github" in lowered
+                or (
+                    "/github copilot.app/contents/frameworks/" in lowered
+                    and "github copilot helper" in lowered
+                )
+            )
+        else:
+            is_copilot = bool(re.search(r"(?:^|[/\s])github-copilot(?:[/\s-]|$)", lowered))
+        if is_copilot:
+            processes.append(f"PID {pid}: {command}")
+    return processes
+
+
+def require_copilot_desktop_closed() -> None:
+    processes = running_copilot_desktop_processes()
+    if processes:
+        details = "; ".join(processes)
+        raise RuntimeError(
+            "GitHub Copilot desktop is running; quit it fully before exporting. "
+            f"Detected: {details}"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -469,6 +523,7 @@ def bundle_history(root: Path) -> bool:
 # --------------------------------------------------------------------------
 
 def cmd_export(args: argparse.Namespace) -> int:
+    require_copilot_desktop_closed()
     src = copilot_home()
     if not src.is_dir():
         log(f"No Copilot home at {src}")
@@ -520,6 +575,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                     log(f"  extensions/{ext.name}/artifacts")
 
         log("==> databases")
+        require_copilot_desktop_closed()
         for name in DATABASES:
             if args.no_history and name in HISTORY_DATABASES:
                 log(f"  {name} skipped (--no-history)")
@@ -553,6 +609,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         except OSError:
             pass
 
+        require_copilot_desktop_closed()
         log("==> packing")
         tarball = out_dir / f"copilot-migration-{stamp}.tar.gz"
         with tarball.open("xb") as out:

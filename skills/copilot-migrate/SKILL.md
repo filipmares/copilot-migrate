@@ -7,8 +7,10 @@ description: Export and restore portable GitHub Copilot desktop configuration, P
 
 Use `scripts/copilot_migrate.py` (Python 3.9+, standard library) for portable
 Copilot desktop migration. Quit the desktop app fully on both source and target
-before copying. SQLite snapshots alone cannot make databases and changing
-session files a coordinated snapshot.
+before copying. Export checks for the desktop process before starting, before
+database snapshots, and before packing, and aborts if it detects the app. This
+is a process check, not a lock; it cannot prevent the app being launched between
+checks or make databases and changing session files a coordinated snapshot.
 
 ```sh
 python3 copilot_migrate.py export --out DIR [--no-history]

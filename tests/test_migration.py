@@ -10,6 +10,8 @@ import tarfile
 import tempfile
 import unittest
 import uuid
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "skills/copilot-migrate/scripts/copilot_migrate.py"
@@ -70,6 +72,49 @@ class MigrationTests(unittest.TestCase):
     def export(self, *args, status=0):
         output = self.run_tool(self.source, "export", "--out", self.out, *args, status=status)
         return next(self.out.glob("*.tar.gz")), output
+
+    def test_export_refuses_when_copilot_desktop_is_running(self):
+        with patch.object(
+            MIGRATE, "running_copilot_desktop_processes",
+            return_value=["github.exe (PID 1234)"],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "quit it fully before exporting"):
+                MIGRATE.cmd_export(SimpleNamespace())
+
+    @patch.object(MIGRATE.sys, "platform", "win32")
+    @patch.object(MIGRATE.subprocess, "run")
+    def test_windows_process_check_matches_github_desktop(self, run):
+        run.return_value = SimpleNamespace(
+            stdout='"github.exe","1234","Console","1","42 K"\r\n'
+                   '"copilot.exe","5678","Console","1","42 K"\r\n'
+        )
+        self.assertEqual(["github.exe (PID 1234)"],
+                         MIGRATE.running_copilot_desktop_processes())
+        run.assert_called_once_with(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    @patch.object(MIGRATE.sys, "platform", "darwin")
+    @patch.object(MIGRATE.subprocess, "run")
+    def test_macos_process_check_matches_app_bundle(self, run):
+        run.return_value = SimpleNamespace(stdout=(
+            "123 /Applications/GitHub Copilot.app/Contents/MacOS/github\n"
+            "456 /Applications/GitHub Copilot.app/Contents/Resources/plugins/"
+            "computer-use/computer-use-mcp\n"
+            "789 /Applications/GitHub Copilot.app/Contents/Frameworks/"
+            "GitHub Copilot Helper.app/Contents/MacOS/GitHub Copilot Helper\n"
+        ))
+        self.assertEqual(
+            [
+                "PID 123: /Applications/GitHub Copilot.app/Contents/MacOS/github",
+                "PID 789: /Applications/GitHub Copilot.app/Contents/Frameworks/"
+                "GitHub Copilot Helper.app/Contents/MacOS/GitHub Copilot Helper",
+            ],
+            MIGRATE.running_copilot_desktop_processes(),
+        )
 
     def test_full_migration_and_backups(self):
         bundle, _ = self.export()
