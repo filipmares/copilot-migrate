@@ -25,8 +25,10 @@ import sqlite3
 import sys
 import tarfile
 import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import quote
 
 # --------------------------------------------------------------------------
 # What we move, and what we deliberately leave behind.
@@ -35,15 +37,22 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 CONFIG_FILES = ["settings.json", "mcp-config.json", "permissions-config.json"]
 DATABASES = ["data.db", "session-store.db"]
 HISTORY_DATABASES = {"session-store.db"}
+HISTORY_DIRS = ("session-state", "chats")
 
 # Directory names never worth carrying: runtime state, caches, build output.
 PRUNE_DIRS = {
     "node_modules", ".venv", "__pycache__", "out", "dist", ".git",
     "user-data", "edge-profile", "Cache", "CacheStorage", "Code Cache",
-    "GPUCache", "Service Worker", "logs",
+    "GPUCache", "Service Worker", "logs", "cache", "caches", "build",
+    "target", "vendor", ".tox", ".next", "run", "servers",
 }
 PRUNE_SUFFIXES = {".db-wal", ".db-shm", ".log", ".pyc"}
 PRUNE_NAMES = {".DS_Store", "Thumbs.db"}
+SENSITIVE_NAMES = {
+    "config.json", "m-encryption-key.enc", "credentials", "credentials.json",
+    "auth.json", "token.json", "tokens.json", ".env", ".npmrc", ".pypirc",
+    ".netrc", ".git-credentials", "id_rsa", "id_ed25519",
+}
 MAX_FILE_BYTES = 10 * 1024 * 1024
 
 EXCLUDED_NOTES = """\
@@ -54,7 +63,7 @@ EXCLUDED_NOTES = """\
   extensions/<ext>/ code      reinstall the extension; only artifacts/ travel
   platform-cache.db           PR/issue cache, rebuilds itself
   embedding-cache.db          rebuilds itself
-  session-state/ state/ logs/ chats/ review-state/ workspaces/
+  state/ logs/ review-state/ workspaces/
   attachments/ browser-output/ media-cache/ run/ servers/
   *.bak-* *.pre-update-backup-*
   gh CLI config               run `gh auth login` on the new machine
@@ -72,6 +81,9 @@ PATH_COLUMNS = [
     ("app_state", "value"),
     ("activity_items", "preview"),
     ("session_open_canvases", "payload"),
+    ("sessions", "cwd"),
+    ("sessions", "workspace_path"),
+    ("sessions", "source_path"),
 ]
 
 HOME_RE = re.compile(r"(?:/Users/|/home/|[A-Za-z]:[\\/]Users[\\/])[^/\\\"'\s,;:)\]}]+")
@@ -89,7 +101,13 @@ def copilot_home() -> Path:
 # Copying helpers
 # --------------------------------------------------------------------------
 
-def should_prune(path: Path) -> bool:
+def should_prune(path: Path, durable: bool = False) -> bool:
+    name = path.name.lower()
+    if durable and (name in SENSITIVE_NAMES or name.startswith((".env.", "token-", "credentials."))
+                    or name in {"mcp-oauth-config", ".ssh", ".aws"}
+                    or name.endswith((".lock", ".pid", ".sock", ".pem", ".key", ".p12", ".pfx"))
+                    or ".bak-" in name or ".pre-update-backup-" in name):
+        return True
     if path.name in PRUNE_NAMES:
         return True
     if path.is_dir():
@@ -97,51 +115,49 @@ def should_prune(path: Path) -> bool:
     if path.suffix in PRUNE_SUFFIXES:
         return True
     try:
-        if path.stat().st_size > MAX_FILE_BYTES:
+        if not durable and path.stat().st_size > MAX_FILE_BYTES:
             return True
     except OSError:
         return True
     return False
 
 
-def copy_tree(src: Path, dst: Path) -> int:
+def copy_tree(src: Path, dst: Path, durable: bool = False) -> int:
     """Copy src into dst, following symlinks and pruning runtime junk."""
     count = 0
     if not src.exists():
         return 0
     dst.mkdir(parents=True, exist_ok=True)
     for entry in sorted(src.iterdir()):
+        if durable and entry.is_symlink():
+            log(f"  ! excluded symlink: {entry}")
+            continue
         try:
             resolved = entry.resolve()
         except OSError:
+            if durable:
+                raise
             continue
-        if should_prune(resolved):
+        if should_prune(resolved, durable):
             continue
         target = dst / entry.name
         if resolved.is_dir():
-            count += copy_tree(resolved, target)
+            count += copy_tree(resolved, target, durable)
         else:
             try:
                 shutil.copy2(resolved, target)
                 count += 1
             except OSError:
-                pass
+                if durable:
+                    raise
     return count
 
 
 def read_conn(path: Path) -> sqlite3.Connection:
-    """Open a database for reading.
-
-    Read-only URI mode fails on a WAL-mode database that has no sidecar -shm
-    file (as is the case for freshly copied snapshots), so fall back to a
-    normal connection.
-    """
-    try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        con.execute("SELECT 1 FROM sqlite_master LIMIT 1")
-        return con
-    except sqlite3.Error:
-        return sqlite3.connect(str(path))
+    """Open a database without creating or changing it."""
+    con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    con.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+    return con
 
 
 def snapshot_db(src: Path, dst: Path) -> bool:
@@ -150,7 +166,7 @@ def snapshot_db(src: Path, dst: Path) -> bool:
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
-        con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        con = sqlite3.connect(src.resolve().as_uri() + "?mode=ro", uri=True)
         out = sqlite3.connect(dst)
         with out:
             con.backup(out)
@@ -233,23 +249,28 @@ TAIL = r'[^"\'\n\r\t,;)\]}<>|*?]*'
 def rewrite_value(value: str, mapping: dict[str, str]) -> str:
     """Rewrite path prefixes in a string, normalising separators for the target."""
     result = value
-    for old, new in mapping.items():
+    for old, new in sorted(mapping.items(), key=lambda item: -len(item[0])):
         win = target_is_windows(new)
         sep = "\\" if win else "/"
         new_root = new.replace("/", "\\") if win else new.replace("\\", "/")
         old_fwd = old.replace("\\", "/")
 
         # file:// URIs always use forward slashes, so handle them first.
-        uri_pattern = re.compile(r"file://(?:/)?" + re.escape(old_fwd) + "(" + TAIL + ")")
-
+        encoded_old = quote(old_fwd, safe="/:")
         def uri_repl(m: "re.Match[str]") -> str:
             tail = m.group(1).replace("\\", "/")
-            return as_uri(new_root.replace("\\", "/") + tail)
+            return as_uri(quote(new_root.replace("\\", "/"), safe="/:") + tail)
 
-        result = uri_pattern.sub(uri_repl, result)
+        for uri_old in {encoded_old, old_fwd}:
+            uri_pattern = re.compile(
+                r"file://(?:/)?" + re.escape(uri_old) + r"(?=$|/)" + "(" + TAIL + ")",
+                re.IGNORECASE if target_is_windows(old) else 0,
+            )
+            result = uri_pattern.sub(uri_repl, result)
 
         for variant in {old, old.replace("/", "\\")}:
-            pattern = re.compile(re.escape(variant) + "(" + TAIL + ")")
+            pattern = re.compile(re.escape(variant) + r"(?=$|[\\/])" + "(" + TAIL + ")",
+                                 re.IGNORECASE if target_is_windows(old) else 0)
 
             def repl(m: "re.Match[str]", _v: str = variant) -> str:
                 tail = m.group(1).replace("\\", "/").replace("/", sep)
@@ -290,7 +311,21 @@ def rewrite_db_paths(db: Path, mapping: dict[str, str], dry_run: bool) -> int:
             for rowid, value in rows:
                 if not value:
                     continue
-                new_value = rewrite_value(value, mapping)
+                try:
+                    data = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    data = None
+                if isinstance(data, (dict, list)):
+                    def walk(node):
+                        if isinstance(node, dict):
+                            return {rewrite_value(k, mapping): walk(v) for k, v in node.items()}
+                        if isinstance(node, list):
+                            return [walk(v) for v in node]
+                        return rewrite_value(node, mapping) if isinstance(node, str) else node
+                    updated = walk(data)
+                    new_value = json.dumps(updated, ensure_ascii=False) if updated != data else value
+                else:
+                    new_value = rewrite_value(value, mapping)
                 if new_value != value:
                     changed += 1
                     if not dry_run:
@@ -313,10 +348,7 @@ def rewrite_json_paths(path: Path, mapping: dict[str, str], dry_run: bool) -> in
     """
     if not path.exists() or not mapping:
         return 0
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return 0
+    data = json.loads(path.read_text(encoding="utf-8"))
 
     count = 0
 
@@ -346,6 +378,92 @@ def rewrite_json_paths(path: Path, mapping: dict[str, str], dry_run: bool) -> in
     return count
 
 
+def session_ids(root: Path) -> set[str]:
+    """Find UUID-backed sessions in the portable session index and state."""
+    ids: set[str] = set()
+    state = root / "session-state"
+    if state.is_dir():
+        for path in state.iterdir():
+            if path.is_dir():
+                try:
+                    uuid.UUID(path.name)
+                    ids.add(path.name)
+                except ValueError:
+                    continue
+    db = root / "db" / "session-store.db"
+    if db.is_file():
+        con = read_conn(db)
+        try:
+            columns = {row[1] for row in con.execute('PRAGMA table_info("sessions")')}
+            if "id" in columns:
+                for (value,) in con.execute('SELECT id FROM sessions WHERE id IS NOT NULL'):
+                    try:
+                        ids.add(str(uuid.UUID(str(value))))
+                    except (ValueError, AttributeError):
+                        continue
+        finally:
+            con.close()
+    return ids
+
+
+def session_warnings(root: Path, history: bool) -> list[str]:
+    if not history:
+        return ["History and resumable session files were intentionally excluded."]
+    warnings = []
+    if not (root / "db" / "data.db").is_file():
+        warnings.append("data.db is missing; Project and workspace relationships cannot be restored.")
+    if not (root / "db" / "session-store.db").is_file():
+        warnings.append("session-store.db is missing; searchable history may be incomplete.")
+    else:
+        con = read_conn(root / "db" / "session-store.db")
+        try:
+            columns = {row[1] for row in con.execute('PRAGMA table_info("sessions")')}
+            if "id" not in columns:
+                warnings.append("Session index schema is unrecognized; journal completeness cannot be verified.")
+        finally:
+            con.close()
+    for session_id in sorted(session_ids(root)):
+        session = root / "session-state" / session_id
+        journal = session / "events.jsonl"
+        if not journal.is_file() or journal.stat().st_size == 0:
+            warnings.append(f"Session {session_id}: missing or empty events.jsonl; cannot claim it is resumable.")
+        else:
+            try:
+                records = 0
+                with journal.open(encoding="utf-8") as events:
+                    for line in events:
+                        if line.strip():
+                            json.loads(line)
+                            records += 1
+                if not records:
+                    raise ValueError("empty journal")
+            except (OSError, UnicodeError, ValueError):
+                warnings.append(f"Session {session_id}: unreadable or malformed events.jsonl; cannot claim it is resumable.")
+        if not any((session / name).is_file() for name in
+                   ("workspace.yaml", "workspace.yml", "workspace.json", "session.json", "metadata.json")):
+            warnings.append(f"Session {session_id}: no recognized session metadata; resumability is uncertain.")
+    if not session_ids(root):
+        warnings.append("No UUID-backed sessions were found; resumability could not be verified.")
+    return warnings
+
+
+def report_session_warnings(root: Path, history: bool) -> list[str]:
+    warnings = session_warnings(root, history)
+    for warning in warnings:
+        log(f"  ! {warning}")
+    return warnings
+
+
+def bundle_history(root: Path) -> bool:
+    info = root / "bundle-info.json"
+    if info.is_file():
+        data = json.loads(info.read_text(encoding="utf-8"))
+        if not isinstance(data.get("history"), bool):
+            raise RuntimeError("invalid bundle history metadata")
+        return data["history"]
+    return True  # Older bundles did not include durable session files.
+
+
 # --------------------------------------------------------------------------
 # Export
 # --------------------------------------------------------------------------
@@ -359,7 +477,9 @@ def cmd_export(args: argparse.Namespace) -> int:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out).expanduser() if args.out else Path.home() / "Desktop"
     if not out_dir.is_dir():
-        out_dir = Path.home()
+        raise RuntimeError(f"output directory does not exist: {out_dir}")
+    if out_dir.resolve() == src.resolve() or src.resolve() in out_dir.resolve().parents:
+        raise RuntimeError("output directory must be outside the source Copilot home")
     tmp = Path(tempfile.mkdtemp())
     stage = tmp / f"copilot-migration-{stamp}"
     stage.mkdir(parents=True)
@@ -407,6 +527,23 @@ def cmd_export(args: argparse.Namespace) -> int:
             dest = stage / "db" / name
             if snapshot_db(src / name, dest):
                 log(f"  {name} ({human(dest.stat().st_size)})")
+            elif (src / name).exists():
+                raise RuntimeError(f"could not snapshot {name}")
+
+        if not args.no_history:
+            log("==> durable sessions and chat working content")
+            for name in HISTORY_DIRS:
+                source = src / name
+                if source.is_symlink():
+                    raise RuntimeError(f"refusing symlinked state directory: {source}")
+                if source.is_dir():
+                    count = copy_tree(source, stage / name, durable=True)
+                    log(f"  {name}: {count} files")
+        (stage / "bundle-info.json").write_text(json.dumps({
+            "version": 1, "history": not args.no_history,
+            "source_home": str(Path.home()),
+        }, indent=2) + "\n", encoding="utf-8")
+        warnings = report_session_warnings(stage, not args.no_history)
 
         write_manifest(stage, src, stamp)
 
@@ -418,15 +555,16 @@ def cmd_export(args: argparse.Namespace) -> int:
 
         log("==> packing")
         tarball = out_dir / f"copilot-migration-{stamp}.tar.gz"
-        with tarfile.open(tarball, "w:gz") as tf:
-            tf.add(stage, arcname=stage.name)
+        with tarball.open("xb") as out:
+            with tarfile.open(fileobj=out, mode="w:gz") as tf:
+                tf.add(stage, arcname=stage.name)
 
         log("")
         log(f"Done: {tarball}  ({human(tarball.stat().st_size)})")
         log("Next: copy it over, then run (from inside the extracted bundle)")
         log(f"  python3 copilot_migrate.py import {tarball.name}    # macOS, Linux")
         log(f"  python  copilot_migrate.py import {tarball.name}    # Windows")
-        return 0
+        return 2 if warnings and not args.no_history else 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -445,6 +583,11 @@ def write_manifest(stage: Path, src: Path, stamp: str) -> None:
             lines.append(f"  {rel.as_posix()}{'/' if p.is_dir() else ''}")
 
     lines += ["", "## Deliberately excluded (re-auth or regenerate)", EXCLUDED_NOTES]
+    lines += ["## Session completeness"]
+    warnings = session_warnings(stage, bundle_history(stage))
+    lines.extend(f"  {warning}" for warning in warnings)
+    if not warnings:
+        lines.append("  Indexed UUID sessions have nonempty journals; actual resumption is not verified.")
 
     db = stage / "db" / "data.db"
     if db.exists():
@@ -487,16 +630,35 @@ def write_manifest(stage: Path, src: Path, stamp: str) -> None:
 
 def extract_bundle(bundle: Path, work: Path) -> Path:
     with tarfile.open(bundle, "r:gz") as tf:
-        # Guard against path traversal in archive members
-        for member in tf.getmembers():
-            target = (work / member.name).resolve()
-            if not str(target).startswith(str(work.resolve())):
-                raise RuntimeError(f"unsafe path in archive: {member.name}")
-        tf.extractall(work)
-    dirs = [d for d in work.iterdir() if d.is_dir()]
-    if not dirs:
+        members = tf.getmembers()
+        names = set()
+        roots = set()
+        for member in members:
+            parts = member.name.split("/")
+            if (not member.name or "\\" in member.name or member.name.startswith("/")
+                    or any(p in ("", ".", "..") or ":" in p for p in parts)
+                    or not (member.isdir() or member.isfile())
+                    or member.name in names):
+                raise RuntimeError(f"unsafe archive member: {member.name}")
+            names.add(member.name)
+            roots.add(parts[0])
+        if len(roots) != 1:
+            raise RuntimeError("unexpected bundle layout")
+        for member in members:
+            target = work.joinpath(*member.name.split("/"))
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = tf.extractfile(member)
+                if source is None:
+                    raise RuntimeError(f"cannot read archive member: {member.name}")
+                with source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+    root = work / next(iter(roots))
+    if not root.is_dir():
         raise RuntimeError("unexpected bundle layout")
-    return dirs[0]
+    return root
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -507,12 +669,13 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         manifest = root / "MANIFEST.md"
         if manifest.exists():
             log(manifest.read_text(encoding="utf-8"))
+        warnings = report_session_warnings(root, bundle_history(root))
         prefixes = detect_home_prefixes(root / "db" / "data.db")
         if prefixes:
             log("Suggested mapping for this machine:")
             for prefix in prefixes:
                 log(f"  --map '{prefix}={Path.home().as_posix()}'")
-        return 0
+        return 2 if warnings and bundle_history(root) else 0
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -521,14 +684,20 @@ def build_mapping(args: argparse.Namespace, root: Path) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for item in args.map or []:
         if "=" not in item:
-            log(f"Ignoring malformed --map value: {item}")
-            continue
+            raise RuntimeError(f"malformed --map value: {item}")
         old, new = item.split("=", 1)
+        if not old.strip("/\\") or not new.strip("/\\"):
+            raise RuntimeError(f"empty --map prefix: {item}")
         mapping[old.rstrip("/\\").replace("\\", "/")] = new.rstrip("/\\")
     if mapping or args.no_rewrite:
         return mapping
 
     # Auto-detect: map every discovered source home onto this machine's home.
+    info = root / "bundle-info.json"
+    if info.is_file():
+        source_home = json.loads(info.read_text(encoding="utf-8")).get("source_home")
+        if isinstance(source_home, str) and source_home:
+            return {source_home.replace("\\", "/").rstrip("/"): str(Path.home())}
     prefixes = detect_home_prefixes(root / "db" / "data.db")
     home = Path.home().as_posix()
     for prefix in prefixes:
@@ -537,17 +706,94 @@ def build_mapping(args: argparse.Namespace, root: Path) -> dict[str, str]:
     return mapping
 
 
+def check_target(dest: Path, rel: Path) -> None:
+    """Reject symlinks in existing destination paths, including merged trees."""
+    if dest.is_symlink():
+        raise RuntimeError(f"refusing symlinked destination: {dest}")
+    current = dest
+    for part in rel.parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(f"refusing symlinked destination: {current}")
+    if current.is_dir():
+        for path in current.rglob("*"):
+            if path.is_symlink():
+                raise RuntimeError(f"refusing symlink in destination tree: {path}")
+
+
+def rewrite_session_metadata(root: Path, mapping: dict[str, str]) -> None:
+    """Rewrite structured path fields, not journals or conversation text."""
+    keys = {"cwd", "path", "workspace_path", "source_path", "repo_path",
+            "checkout_path", "main_repo_path", "root_resource_uri"}
+
+    def walk(value, key=""):
+        if isinstance(value, dict):
+            return {k: walk(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v, key) for v in value]
+        if isinstance(value, str) and key in keys:
+            return rewrite_value(value, mapping)
+        return value
+
+    state = root / "session-state"
+    if not state.is_dir() or not mapping:
+        return
+    for session in state.iterdir():
+        if not session.is_dir():
+            continue
+        for name in ("workspace.json", "session.json", "metadata.json"):
+            path = session / name
+            if path.is_file():
+                original = json.loads(path.read_text(encoding="utf-8"))
+                updated = walk(original)
+                if updated != original:
+                    path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+
+
+def indexed_ids(db: Path, table: str) -> set[str]:
+    if not db.is_file():
+        raise RuntimeError(f"session recovery requires database: {db}")
+    con = read_conn(db)
+    try:
+        columns = {row[1] for row in con.execute(f'PRAGMA table_info("{table}")')}
+        if "id" not in columns:
+            raise RuntimeError(f"session recovery cannot verify {table} identities in {db}")
+        return {str(row[0]) for row in con.execute(f'SELECT id FROM "{table}" WHERE id IS NOT NULL')}
+    finally:
+        con.close()
+
+
 def cmd_import(args: argparse.Namespace) -> int:
     bundle = Path(args.bundle).expanduser()
     if not bundle.is_file():
         log(f"No such bundle: {bundle}")
         return 1
 
-    dest = copilot_home()
+    dest = copilot_home().expanduser()
+    if dest.is_symlink():
+        raise RuntimeError(f"refusing symlinked Copilot home: {dest}")
+    if dest.resolve() == bundle.resolve() or dest.resolve() in bundle.resolve().parents:
+        raise RuntimeError("bundle must be outside the destination Copilot home")
     work = Path(tempfile.mkdtemp())
     try:
         root = extract_bundle(bundle, work)
         mapping = build_mapping(args, root)
+        history = bundle_history(root)
+        warnings = report_session_warnings(root, history)
+        if args.sessions_only:
+            if not history:
+                raise RuntimeError("session recovery requires a bundle with history")
+            if warnings:
+                raise RuntimeError("session recovery refused: bundle session data is incomplete")
+            source_ids = session_ids(root)
+            target_ids = indexed_ids(dest / "session-store.db", "sessions")
+            if not source_ids or not source_ids.issubset(target_ids):
+                raise RuntimeError("session recovery requires matching session IDs in the target session index")
+            source_projects = indexed_ids(root / "db" / "data.db", "projects")
+            target_projects = indexed_ids(dest / "data.db", "projects")
+            if not source_projects.issubset(target_projects):
+                raise RuntimeError("session recovery requires matching Project IDs in the target database")
+            log("==> session recovery: target databases and configuration will not be overwritten")
 
         log(f"==> importing into {dest}")
         if args.dry_run:
@@ -559,68 +805,82 @@ def cmd_import(args: argparse.Namespace) -> int:
         else:
             log("==> path rewriting disabled")
 
-        dest.mkdir(parents=True, exist_ok=True)
-        backup = dest / f"pre-import-backup-{datetime.now():%Y%m%d-%H%M%S}"
-
-        def preserve(rel: str) -> None:
-            existing = dest / rel
-            if existing.exists() and not args.dry_run:
-                target = backup / rel
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if existing.is_dir():
-                    shutil.copytree(existing, target, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(existing, target)
-
-        log("-- config files")
-        for name in CONFIG_FILES:
+        operations: list[tuple[Path, Path, str]] = []
+        for name in ([] if args.sessions_only else CONFIG_FILES):
             f = root / name
             if not f.is_file():
                 continue
-            preserve(name)
-            if not args.dry_run:
-                shutil.copy2(f, dest / name)
-                rewrite_json_paths(dest / name, mapping, args.dry_run)
-            log(f"  {name}")
+            rewrite_json_paths(f, mapping, False)
+            operations.append((f, Path(name), "file"))
 
-        for folder in ("skills", "automation"):
+        for folder in (() if args.sessions_only else ("skills", "automation")):
             srcdir = root / folder
             if srcdir.is_dir():
-                log(f"-- {folder}")
-                preserve(folder)
-                if not args.dry_run:
-                    shutil.copytree(srcdir, dest / folder, dirs_exist_ok=True)
-                log(f"  {folder} restored")
+                operations.append((srcdir, Path(folder), "merge"))
 
         ext = root / "extensions"
-        if ext.is_dir():
-            log("-- extension artifacts")
+        if ext.is_dir() and not args.sessions_only:
             for e in sorted(p for p in ext.iterdir() if p.is_dir()):
                 art = e / "artifacts"
-                if art.is_dir() and not args.dry_run:
-                    shutil.copytree(
-                        art, dest / "extensions" / e.name / "artifacts",
-                        dirs_exist_ok=True,
-                    )
-                log(f"  extensions/{e.name}/artifacts")
+                if art.is_dir():
+                    operations.append((art, Path("extensions") / e.name / "artifacts", "merge"))
 
-        log("-- databases")
-        for name in DATABASES:
+        for name in ([] if args.sessions_only else DATABASES):
             f = root / "db" / name
             if not f.is_file():
                 continue
-            preserve(name)
-            if not args.dry_run:
-                for side in ("-wal", "-shm"):
-                    stale = dest / (name + side)
-                    if stale.exists():
-                        stale.unlink()
-                shutil.copy2(f, dest / name)
-                changed = rewrite_db_paths(dest / name, mapping, args.dry_run)
-            else:
-                changed = rewrite_db_paths(f, mapping, True)
+            changed = rewrite_db_paths(f, mapping, False)
             suffix = f", {changed} path values rewritten" if mapping else ""
             log(f"  {name}{suffix}")
+            operations.append((f, Path(name), "file"))
+            for side in ("-wal", "-shm"):
+                operations.append((f, Path(name + side), "remove"))
+
+        if history:
+            rewrite_session_metadata(root, mapping)
+            for folder in HISTORY_DIRS:
+                srcdir = root / folder
+                if srcdir.is_dir():
+                    for entry in sorted(srcdir.iterdir()):
+                        operations.append((entry, Path(folder) / entry.name, "replace"))
+
+        for source, rel, mode in operations:
+            check_target(dest, rel)
+            target = dest / rel
+            if target.exists() and mode in ("file", "merge"):
+                if (mode == "file" and not target.is_file()) or (mode == "merge" and not target.is_dir()):
+                    raise RuntimeError(f"incompatible destination type: {target}")
+            log(f"  {'remove stale' if mode == 'remove' else 'restore'} {rel}"
+                + (" (existing target will be backed up)" if target.exists() else ""))
+
+        backup = None
+        if not args.dry_run:
+            dest.mkdir(parents=True, exist_ok=True)
+            backup = Path(tempfile.mkdtemp(prefix=f"pre-import-backup-{datetime.now():%Y%m%d-%H%M%S}-", dir=dest))
+            log(f"==> backing up replaced files to {backup}")
+            for _, rel, _ in operations:
+                existing = dest / rel
+                if existing.exists():
+                    target = backup / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if existing.is_dir():
+                        shutil.copytree(existing, target, symlinks=True)
+                    else:
+                        shutil.copy2(existing, target)
+            for source, rel, mode in operations:
+                target = dest / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if mode in ("replace", "remove") and target.exists():
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                if mode == "remove":
+                    continue
+                if source.is_dir():
+                    shutil.copytree(source, target, dirs_exist_ok=(mode == "merge"))
+                else:
+                    shutil.copy2(source, target)
 
         log("")
         log("==> manual follow-ups")
@@ -631,10 +891,10 @@ def cmd_import(args: argparse.Namespace) -> int:
         log("  5. Clone repos to the rewritten paths shown above.")
         log("  6. Reinstall dependencies for skills that used node_modules/venvs.")
         log("  7. On Windows, replace `python3` with `python` in automation prompts.")
-        if not args.dry_run:
+        if backup is not None:
             log("")
             log(f"Backup of replaced files: {backup}")
-        return 0
+        return 2 if warnings and history else 0
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -647,7 +907,7 @@ def main() -> int:
     ex = sub.add_parser("export", help="create a migration bundle")
     ex.add_argument("--out", help="output directory (default: ~/Desktop)")
     ex.add_argument("--no-history", action="store_true",
-                    help="skip session-store.db (much smaller bundle)")
+                    help="skip session-store.db, session-state and chats")
     ex.set_defaults(func=cmd_export)
 
     ins = sub.add_parser("inspect", help="show a bundle's manifest and path prefixes")
@@ -661,10 +921,16 @@ def main() -> int:
     im.add_argument("--no-rewrite", action="store_true",
                     help="leave stored paths untouched")
     im.add_argument("--dry-run", action="store_true")
+    im.add_argument("--sessions-only", action="store_true",
+                    help="recover session/chat files without replacing target databases or configuration")
     im.set_defaults(func=cmd_import)
 
     args = parser.parse_args()
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (OSError, sqlite3.Error, tarfile.TarError, RuntimeError, ValueError) as exc:
+        log(f"Error: {exc}")
+        return 1
 
 
 if __name__ == "__main__":

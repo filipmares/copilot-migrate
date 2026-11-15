@@ -1,121 +1,67 @@
 ---
 name: copilot-migrate
-description: Move a GitHub Copilot app installation between machines, including across operating systems. Exports settings, skills, MCP config, tool permissions, canvas extension artifacts, saved workflows and chat history into one bundle, then restores it and rewrites the absolute filesystem paths stored in Copilot's databases so projects still resolve on the new machine. Use when migrating, backing up, cloning, or restoring a Copilot setup, moving from macOS to Windows or back, setting up a new laptop, or auditing what Copilot configuration exists locally.
+description: Export and restore portable GitHub Copilot desktop configuration, Projects, session journals and chat content across machines, with path mapping, backups and incomplete-session reporting.
 ---
 
 # Copilot Migrate
 
-Move a Copilot installation to a new machine without hand-copying files or
-losing project wiring.
-
-The hard part is not the copying. Copilot stores **absolute filesystem paths**
-in its SQLite databases and in `permissions-config.json`. A plain file copy to a
-machine with a different username — or a different OS — leaves every project
-pointing at a directory that does not exist. This skill's script rewrites those
-paths on import.
-
-## The script
-
-`scripts/copilot_migrate.py`, alongside this file — Python 3.9+, standard
-library only, no dependencies. Runs on macOS, Windows and Linux. Each bundle
-contains a copy of the script, so the destination machine needs nothing but
-Python.
+Use `scripts/copilot_migrate.py` (Python 3.9+, standard library) for portable
+Copilot desktop migration. Quit the desktop app fully on both source and target
+before copying. SQLite snapshots alone cannot make databases and changing
+session files a coordinated snapshot.
 
 ```sh
-python3 copilot_migrate.py export  [--out DIR] [--no-history]
+python3 copilot_migrate.py export --out DIR [--no-history]
 python3 copilot_migrate.py inspect BUNDLE
-python3 copilot_migrate.py import  BUNDLE [--map OLD=NEW] [--no-rewrite] [--dry-run]
+python3 copilot_migrate.py import BUNDLE [--map OLD=NEW] [--no-rewrite] [--dry-run] [--sessions-only]
 ```
 
-On Windows the interpreter is `python`, not `python3`. Windows ships a `python3`
-stub that opens the Microsoft Store instead of running anything, so using the
-wrong one fails quietly rather than loudly — tell the user to check
-`python --version` first.
+On Windows use `python`. `COPILOT_HOME` overrides the Copilot directory. The
+output directory must exist and be outside the source home; the bundle must
+be outside the target home. Protect bundles: they contain private conversations,
+and user-authored files may contain secrets even after exclusions. Never upload
+backups or conversation content to GitHub.
 
-## Workflow
+Default export includes `data.db`, `session-store.db`, settings, MCP and tool
+permissions, skills, personal automation, extension artifacts, durable
+`session-state/` (journals, metadata, checkpoints, artifacts), and `chats/`
+working content. Session/chat files are not capped at 10 MB; other copied trees
+retain the 10 MB cap. Authentication, OAuth, encryption keys, transient locks,
+processes, caches, installed plugin/extension code, dependency/build trees,
+repository `.git` directories and session/chat symlinks are excluded. Content
+filtering is not a guarantee of secret removal.
 
-1. **Export** on the old machine. `--no-history` skips `session-store.db`, which
-   is usually the bulk of the bundle, when past conversations are not needed.
-2. **Inspect** the bundle. Prints the manifest — workflows, accounts, projects,
-   the home-directory prefixes found inside the databases — and suggests a
-   `--map` for the current machine. Read-only.
-3. **Import** on the new machine, with the Copilot app **fully quit**. Paths are
-   remapped automatically from the source home to this machine's home. Anything
-   overwritten is copied to `pre-import-backup-<timestamp>/` first.
+`--no-history` omits `session-store.db`, `session-state/` and `chats/`, but
+still includes `data.db` and its Project/session identities and other metadata.
+On import, existing target history is left in place and may not correspond to
+the replaced database. This is not a resumable-session restore or history wipe.
 
-Use `--dry-run` first when unsure; it reports what would change and writes
-nothing.
+Inspect and dry-run before importing. Import replaces bundled databases and
+affected session/chat directories, rather than merging their records. Before
+writing, it backs up all conflicting targets, including WAL/SHM files and
+extension artifacts, into a uniquely named `pre-import-backup-*` under the
+target home. Also keep an independent full target backup. A failure during
+application may require manual recovery from backup; import is not transactional.
+For recovery into an already-restored target, `--sessions-only` leaves target
+databases and configuration unchanged. It requires the target session and
+Project IDs to contain those from the bundle; it refuses when identities
+cannot be verified or the bundle reports incomplete session data. Conflicting
+session/chat directories are backed up and replaced. The target databases are
+not path-rewritten in this mode.
 
-Set `COPILOT_HOME` to point at a non-default Copilot directory (useful for
-testing an import into a scratch directory).
+The source home is mapped to the target home by default. `--map` can be
+repeated for different layouts; longer prefixes take priority. Known database
+path columns, JSON configuration and known path fields in session metadata JSON
+are rewritten, not journals, free text, unknown columns or YAML metadata.
+Paths with spaces are supported. Mapping does not clone repositories, recreate
+worktrees, preserve uncommitted repository changes, or include external files.
+Recreate and check repository/worktree paths and path-keyed permissions.
 
-## What travels
-
-- `settings.json`, `mcp-config.json`, `permissions-config.json`
-- `skills/` — symlinked skills are resolved to real files
-- `automation/` — personal scripts and their SQLite state
-- `extensions/<name>/artifacts/` — canvas extension content, such as notes
-- `data.db` — projects, workspaces, accounts, saved workflows
-- `session-store.db` — chat history, unless `--no-history`
-
-Databases are copied with SQLite's online backup API, so a running app cannot
-produce a torn snapshot, and are rolled out of WAL mode so each file is
-self-contained and portable.
-
-## What is deliberately left behind
-
-Machine-bound or regenerable, and listed in every bundle's `MANIFEST.md`:
-
-| Excluded | Why |
-| --- | --- |
-| `config.json`, `m-encryption-key.enc` | machine-bound auth and encryption state |
-| `mcp-oauth-config/` | OAuth tokens; re-authenticate instead |
-| `installed-plugins/` | reinstall from the marketplaces named in `settings.json` |
-| `extensions/<name>/` code | reinstall the extension; only `artifacts/` travel |
-| `platform-cache.db`, `embedding-cache.db` | caches that rebuild themselves |
-| `session-state/`, `state/`, `logs/`, `chats/`, `workspaces/` | large runtime state |
-| `*.bak-*`, `*.pre-update-backup-*` | stale local backups |
-
-Runtime junk is pruned while copying: `node_modules`, `.venv`, `__pycache__`,
-`.git`, build output, browser profiles, caches, and any single file over 10 MB.
-That last cap matters — a skill symlinked to a folder containing a browser
-profile will otherwise drag in gigabytes.
-
-## Path rewriting
-
-These columns hold absolute paths and are rewritten on import:
-
-`projects.main_repo_path`, `worktrees.path`,
-`workspace_checkout_bindings.repo_path` / `.checkout_path`,
-`workspaces.source_path`, `project_checkouts.root_resource_uri`,
-`settings.storage_location`, `app_state.value`, `activity_items.preview`,
-`session_open_canvases.payload` — plus every string and **key** in the JSON
-config files, since `permissions-config.json` is keyed by directory path.
-
-Separator style follows the target: `C:\Users\me\src\repo` for plain paths,
-`file:///C:/Users/me/src/repo` for URIs, forward slashes on POSIX. Paths
-containing spaces (`Application Support`, OneDrive folders) are preserved.
-
-Rewriting is prefix-based on the home directory. It does **not** rewrite free
-text inside workflow prompts, so check those separately if they hardcode paths;
-prompts referring to `~/.copilot` are fine.
-
-## After importing
-
-The script prints these, and they are not optional:
-
-1. Sign in to each GitHub account listed in `MANIFEST.md`.
-2. Re-authenticate MCP servers.
-3. Reinstall plugins from the marketplaces in `settings.json`.
-4. Reinstall canvas extensions, then confirm `artifacts/` survived.
-5. Clone repositories to the rewritten paths, or edit `permissions-config.json`
-   so its per-directory tool approvals still match. Approvals are path-keyed and
-   fail silently when a path no longer matches.
-6. Reinstall dependencies for skills that used `node_modules` or a virtualenv.
-7. On Windows, `python3` in any migrated automation prompt becomes `python`.
-
-## Auditing without migrating
-
-`export --no-history` followed by `inspect` is a fast way to answer "what is
-actually in my Copilot setup?" — the manifest lists skills, workflows and their
-schedules, accounts, projects and their paths, and everything excluded.
+Export, inspect and import report missing or malformed journals for UUID-backed
+sessions found in the index or state directories, missing recognized metadata,
+missing databases, and unrecognized index schemas. Exit code 2 means history is incomplete even
+though export/import completed, 1 means an error, and 0 means no detected
+incompleteness (or intentional `--no-history`). Older bundles may lack journals.
+These checks do not prove actual desktop resumption or compatibility with every
+application version. Reauthenticate GitHub and MCP, reinstall plugins,
+extensions and dependencies, and inspect warnings before opening the app.

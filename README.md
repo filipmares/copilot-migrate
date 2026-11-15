@@ -1,124 +1,110 @@
 # copilot-migrate
 
-[![skills.sh](https://skills.sh/b/filipmares/copilot-migrate)](https://skills.sh/filipmares/copilot-migrate)
+Export GitHub Copilot desktop configuration and portable session data between
+machines, including Windows and macOS. The standalone script requires Python
+3.9+ and has no external dependencies.
 
-Move a [GitHub Copilot](https://github.com/features/copilot) app installation
-between machines — including across operating systems — without losing your
-projects, workflows, skills or tool permissions.
+## Migration
 
-Packaged as an agent skill, but the script works standalone.
-
-## Why this exists
-
-Copying `~/.copilot` to a new machine mostly works, right up until you open the
-app and every project is broken. Copilot stores **absolute filesystem paths** in
-its SQLite databases and in `permissions-config.json`. A different username — or
-a different operating system — invalidates all of them.
-
-On a real installation that is roughly **4,300 path values across 10 columns**.
-This tool rewrites them.
-
-## Install
-
-Via [skills.sh](https://skills.sh) — works with Claude Code, Codex, Cursor,
-Copilot and [many other agents](https://github.com/vercel-labs/skills#supported-agents):
+Quit the Copilot desktop app **fully on both machines** before exporting or
+importing. SQLite snapshots are consistent individually, but a running app can
+change its databases and session files between copies.
 
 ```sh
-npx skills add filipmares/copilot-migrate
-```
+# Source: use `python` instead of `python3` on Windows
+python3 skills/copilot-migrate/scripts/copilot_migrate.py export --out ~/Desktop
 
-As a GitHub Copilot skill, without the CLI:
-
-```sh
-git clone https://github.com/filipmares/copilot-migrate /tmp/cm \
-  && cp -r /tmp/cm/skills/copilot-migrate ~/.copilot/skills/
-```
-
-Standalone — the script has no dependencies beyond Python 3.9+, so you can skip
-the skill entirely:
-
-```sh
-curl -O https://raw.githubusercontent.com/filipmares/copilot-migrate/main/skills/copilot-migrate/scripts/copilot_migrate.py
-```
-
-## Use
-
-```sh
-# On the old machine
-python3 copilot_migrate.py export --out ~/Desktop                 # everything
-python3 copilot_migrate.py export --out ~/Desktop --no-history    # skip chat history
-
-# Look before you leap (read-only)
+# Copy the private bundle securely to the target, outside ~/.copilot.
 python3 copilot_migrate.py inspect copilot-migration-*.tar.gz
-
-# On the new machine, with the Copilot app quit
 python3 copilot_migrate.py import copilot-migration-*.tar.gz --dry-run
 python3 copilot_migrate.py import copilot-migration-*.tar.gz
 ```
 
-> **Windows:** the interpreter is `python`, not `python3` — substitute it in
-> every command above. Windows ships a `python3` stub that opens the Microsoft
-> Store rather than running anything, so the mistake is quiet rather than
-> obvious. Verify with `python --version` before starting.
+To recover session/chat files into an already-restored target without replacing
+its databases or configuration, use `import BUNDLE --sessions-only`. It requires
+the target databases to contain the bundle's indexed session and Project IDs;
+it refuses recovery when those identities cannot be verified or the bundle
+reports incomplete session data. Conflicting
+session/chat directories are backed up and replaced, not merged. Use
+`--dry-run` first and review path mappings; the target databases are not rewritten.
 
-Import auto-detects the source home directory and maps it onto the new machine's
-home. Override when the layout differs:
+The bundle includes the script. `COPILOT_HOME` overrides the source or target
+Copilot directory. The output directory must exist and be outside the source
+Copilot home; an existing bundle is never overwritten. Bundles contain private
+conversation content and may contain sensitive information in user-authored
+files: protect them, review them before sharing, and never upload them to GitHub.
 
-```sh
-python3 copilot_migrate.py import bundle.tar.gz --map '/Users/alice=D:\dev\home'
-python3 copilot_migrate.py import bundle.tar.gz --no-rewrite
-```
-
-Every bundle ships a copy of the script, so the destination machine needs only
-Python. Anything overwritten on import is saved to `pre-import-backup-<stamp>/`.
+By default, import **replaces** the bundled databases and affected session/chat
+directories; it does not merge database records. It first backs up every
+replaced target, including database WAL/SHM files and extension artifacts, in a
+uniquely named `pre-import-backup-*` directory under the target Copilot home.
+Unrelated session/chat directories remain in place. Keep an independent backup
+of the entire target home before importing. If a write fails after import starts,
+restore from that backup with the app still closed; import is not transactional.
+The bundle must be outside the target Copilot home. Dry-run does not change it.
 
 ## What moves
 
-Settings, MCP server config, per-directory tool permissions, user skills,
-personal automation scripts, canvas extension artifacts, and the databases
-holding your projects, accounts, saved workflows and chat history.
+The default export contains `data.db`, `session-store.db`, settings, MCP and
+permissions configuration, skills, personal automation, extension artifacts,
+`session-state/` (including `events.jsonl`, metadata, checkpoints and artifacts)
+and `chats/` working content. Session and chat files have no 10 MB per-file
+limit; the existing 10 MB limit still applies to other copied trees.
 
-Left behind on purpose: OAuth tokens, machine-bound auth and encryption state,
-marketplace plugins, caches, logs and session runtime state. Each bundle's
-`MANIFEST.md` lists exactly what was included, what was excluded and why, plus
-your workflows, accounts and project paths.
+Use `export --no-history` for configuration-oriented migration: it omits
+`session-store.db`, `session-state/` and `chats/`, but **still includes
+`data.db`**, which may contain Project/session identities and other metadata.
+Import leaves any existing target history files in place; those files can be
+inconsistent with the replaced database. This mode does not restore resumable
+sessions or guarantee removal of existing history.
 
-Runtime junk is pruned while copying — `node_modules`, `.venv`, `.git`, build
-output, browser profiles, caches, and any file over 10 MB.
+Excluded: machine-bound authentication and encryption files, OAuth credentials,
+installed plugins and extension code, caches, locks, processes, logs, dependency
+and build trees, repository `.git` directories and symlinks in session/chat
+content. User-authored files can still contain secrets; filtering is not a
+guarantee of secret removal. Installed runtimes, authentication and live
+processes are not migrated. Reauthenticate accounts and MCP servers and
+reinstall plugins, extensions and dependencies on the target.
 
-## Path rewriting
+## Paths and limitations
 
-Separator style follows the target platform:
+Import maps the recorded source home to the target home. For a different layout
+or older bundles use repeatable explicit mappings; the most specific prefix
+is applied first:
 
-| Source | Target | Result |
-| --- | --- | --- |
-| `/Users/alice/src/app` | Windows | `C:\Users\bob\src\app` |
-| `file:///Users/alice/src/app` | Windows | `file:///C:/Users/bob/src/app` |
-| `C:\Users\bob\src\app` | macOS | `/Users/alice/src/app` |
+```sh
+python3 copilot_migrate.py import bundle.tar.gz --map 'C:\Users\Alex Example=/Users/alex'
+python3 copilot_migrate.py import bundle.tar.gz --no-rewrite
+```
 
-Paths containing spaces are preserved. JSON is parsed and re-serialized rather
-than string-replaced, so Windows backslashes are escaped correctly — including
-in object keys, which is how `permissions-config.json` stores directories.
+Known path columns in the databases, JSON configuration, and known structured
+session metadata JSON path fields are rewritten. Conversation journals, free
+text, other metadata formats (including YAML), and unknown database columns
+are not rewritten. Inspect them and adjust paths as appropriate; a mapping does
+not copy repositories or recreate worktrees. Clone repositories and recreate
+worktrees at the mapped locations, or adjust bindings manually. Uncommitted
+repository changes and external files are not included. Permissions are
+path-keyed and may need review.
 
-Rewriting is prefix-based on the home directory and does not touch free text
-inside workflow prompts. Check those separately if they hardcode paths.
+Export, inspect and import report missing or malformed journals for UUID-backed
+sessions discoverable in the session index or session-state directories, and
+flags missing recognized metadata. A missing database or unrecognized session
+index is also reported. They return
+exit code 2 for incomplete history (the bundle/import is still produced), 1 for
+an error, and 0 otherwise. `--no-history` reports its intentional omission
+without treating it as an error. Older bundles that lack session files may be
+incomplete even if their database contains searchable history.
 
-## Notes
+These checks do **not** prove metadata compatibility or actual desktop
+resumption; application versions and local workspace dependencies may differ.
+Review the manifest and warnings before opening the app. No actual desktop
+restore is verified by the synthetic tests.
 
-- Run `import` with the Copilot app fully quit.
-- Databases are copied with SQLite's online backup API, so a running app cannot
-  produce a torn snapshot, and are rolled out of WAL mode so each file is
-  self-contained and portable.
-- `COPILOT_HOME` overrides the Copilot directory, which makes it easy to test an
-  import into a scratch folder.
-- Import prints follow-ups that genuinely matter: re-auth accounts and MCP
-  servers, reinstall plugins and extensions, and clone repos to the rewritten
-  paths so path-keyed tool approvals keep matching.
+## Tests
 
-## Auditing
-
-`export --no-history` then `inspect` answers "what is actually in my Copilot
-setup?" — skills, workflows and schedules, accounts, projects and their paths.
+```sh
+python3 -m unittest discover -s tests -v
+```
 
 ## License
 
